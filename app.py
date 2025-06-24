@@ -236,6 +236,21 @@ st.sidebar.info(
 sel = list(range(year_range[0], year_range[1] + 1))
 fdf = merged[merged["Fiscal Year"].isin(sel)]
 
+# ── Load OEWS wage data ─────────────────────────────────────────────────
+wage_df = pd.read_csv("Data/oe_industry_wages_clean.csv")
+# Ensure NAICS is same type as your fdf
+wage_df["NAICS"] = wage_df["NAICS"].astype(str)
+fdf["Industry (NAICS) Code"] = fdf["Industry (NAICS) Code"].astype(str)
+
+# Normalize NAICS codes by extracting just the numeric part
+def normalize_naics(code):
+    # Extract first number from formats like "54" or "54 - Professional, Scientific, and Technical Services"
+    match = re.search(r'^(\d+)', str(code))
+    return match.group(1) if match else code
+
+wage_df["NAICS_norm"] = wage_df["NAICS"].apply(normalize_naics)
+fdf["NAICS_norm"] = fdf["Industry (NAICS) Code"].apply(normalize_naics)
+
 # ── 6) VISUALS ──────────────────────────────────────────────────────────
 # Main title
 st.title("H1B Visa Analysis Dashboard")
@@ -280,39 +295,122 @@ st.markdown("""
 This map shows total H1B petitions by state. Hover over a state to see detailed approval/denial breakdowns. 
 Darker colors indicate higher petition volumes, helping identify major H1B sponsorship hubs.
 """)
+
+# Add metric selection
+metric_choice = st.radio(
+    "Select metric to display:",
+    options=["Application Numbers", "Median Salary"],
+    index=0,
+    horizontal=True
+)
+
+# Calculate state-level statistics
 state_stats = (
     fdf.groupby("Petitioner State")
-    .agg({'Total Applications': 'sum', 
-          'Initial Approval':'sum',
-          'Initial Denial':'sum',
-          'Continuing Approval':'sum',
-          'Continuing Denial':'sum'})
+    .agg({
+        'Total Applications': 'sum',
+        'Initial Approval': 'sum',
+        'Initial Denial': 'sum',
+        'Continuing Approval': 'sum',
+        'Continuing Denial': 'sum'
+    })
     .reset_index()
 )
-fig_map = go.Figure(data=go.Choropleth(
-    locations=state_stats['Petitioner State'],
-    z=state_stats['Total Applications'],
-    locationmode='USA-states',
-    colorscale='Viridis',
-    marker_line_color='white',
-    marker_line_width=0.5,
-    text=state_stats.apply(
-        lambda x: (
-            f"State: {x['Petitioner State']}<br>"
-            f"Total: {x['Total Applications']:,}<br>"
-            f"Init App: {x['Initial Approval']:,}<br>"
-            f"Init Den: {x['Initial Denial']:,}"
-        ), axis=1
-    ),
-    hovertemplate="%{text}<extra></extra>"
-))
-fig_map.update_layout(
-    geo=dict(scope='usa', projection=dict(type='albers usa'), showlakes=True),
-    margin={"r":0,"t":30,"l":0,"b":0}, height=600,
-    title="H1B Applications by State"
+
+# Calculate weighted average salary by state if needed
+if metric_choice == "Median Salary":
+    # 1) compute counts by state & industry
+    counts = (
+        fdf
+        .groupby(["Petitioner State","NAICS_norm"])["Total Applications"]
+        .sum()
+        .reset_index(name="h1b_count")
+    )
+    # 2) merge in the industry median wage
+    merged = counts.merge(
+        wage_df[["NAICS_norm","Annual_Median"]],
+        on="NAICS_norm",
+        how="left"
+    ).dropna(subset=["Annual_Median"])
+    
+    # Ensure numeric types
+    merged["h1b_count"] = pd.to_numeric(merged["h1b_count"], errors="coerce")
+    merged["Annual_Median"] = pd.to_numeric(merged["Annual_Median"], errors="coerce")
+    
+    # 3) weighted average per state
+    state_salary = (
+        merged
+        .assign(weighted = merged["h1b_count"] * merged["Annual_Median"])
+        .groupby("Petitioner State")
+        .agg(total_apps=("h1b_count","sum"), sum_weighted=("weighted","sum"))
+        .reset_index()
+    )
+    state_salary["avg_salary"] = state_salary["sum_weighted"] / state_salary["total_apps"]
+    
+    # 4) merge back to state_stats
+    state_stats = state_stats.merge(
+        state_salary[["Petitioner State","avg_salary"]],
+        on="Petitioner State",
+        how="left"
+    )
+
+# Create choropleth
+zcol = "Total Applications" if metric_choice=="Application Numbers" else "avg_salary"
+hover_text = (
+    "<b>%{location}</b><br>" +
+    (  # choose which fields to show
+        "Total Apps: %{z:,}" if metric_choice=="Application Numbers"
+        else "Avg Salary: $%{z:,.0f}"
+    )
 )
+
+fig_map = go.Figure(go.Choropleth(
+    locations=state_stats["Petitioner State"],
+    z=state_stats[zcol],
+    locationmode="USA-states",
+    colorscale="Viridis",
+    marker_line_color="white",
+    marker_line_width=0.5,
+    hovertemplate=hover_text + "<extra></extra>"
+))
+
+fig_map.update_layout(
+    title=(
+        "H1B Applications by State" 
+        if metric_choice=="Application Numbers" 
+        else "Average H-1B Salary by State"
+    ),
+    geo=dict(scope='usa', projection=dict(type='albers usa'), showlakes=True),
+    margin={"r":0,"t":30,"l":0,"b":0}, 
+    height=600
+)
+
+# Apply consistent styling
 fig_map = apply_consistent_style(fig_map)
+
 st.plotly_chart(fig_map, use_container_width=True)
+
+# Add detailed statistics in an expander
+with st.expander("View Detailed State Statistics"):
+    if metric_choice == "Application Numbers":
+        display_stats = state_stats[["Petitioner State", "Total Applications", "Initial Approval", "Initial Denial"]].copy()
+        display_stats["Approval Rate"] = (
+            display_stats["Initial Approval"] / 
+            (display_stats["Initial Approval"] + display_stats["Initial Denial"])
+        ).round(3)
+        
+        # Format numbers
+        for col in ["Total Applications", "Initial Approval", "Initial Denial"]:
+            display_stats[col] = display_stats[col].map("{:,}".format)
+        display_stats["Approval Rate"] = display_stats["Approval Rate"].map("{:.1%}".format)
+    else:
+        display_stats = state_stats[["Petitioner State", "avg_salary"]].copy()
+        display_stats["avg_salary"] = display_stats["avg_salary"].map("${:,.0f}".format)
+    
+    st.dataframe(
+        display_stats,
+        use_container_width=True
+    )
 
 st.markdown("---")
 
@@ -463,6 +561,118 @@ st.plotly_chart(fig_comp, use_container_width=True)
 
 st.markdown("---")
 
+# Add new section for company trends over time
+st.subheader("H‑1B Application Trends for Top Companies")
+st.markdown("""
+Track how application volumes have changed over time for major H‑1B sponsors. This visualization helps 
+identify which companies have been consistently active in hiring foreign talent and how their hiring 
+patterns have evolved.
+""")
+
+# Get top 5 companies from the current selection
+top5_companies = comp_stats.nlargest(5, 'Total Applications')['Employer (Petitioner) Name'].tolist()
+
+# Calculate yearly totals for these companies
+company_trends = (
+    df_state[df_state["Employer (Petitioner) Name"].isin(top5_companies)]
+    .groupby(["Fiscal Year", "Employer (Petitioner) Name"])
+    .agg({
+        "Total Applications": "sum",
+        "Initial Approval": "sum",
+        "Initial Denial": "sum",
+        "Continuing Approval": "sum",
+        "Continuing Denial": "sum"
+    })
+    .reset_index()
+)
+
+# Create line chart
+fig_trends = px.line(
+    company_trends,
+    x="Fiscal Year",
+    y="Total Applications",
+    color="Employer (Petitioner) Name",
+    markers=True,
+    labels={"Total Applications": "Number of Applications"},
+    title="H‑1B Application Trends for Top Companies"
+)
+
+# Update hover template to show detailed information
+fig_trends.update_traces(
+    hovertemplate="<b>%{fullData.name}</b><br>" +
+                 "Year: %{x}<br>" +
+                 "Total Applications: %{y:,}<br>" +
+                 "<extra></extra>",
+    line=dict(width=2)
+)
+
+# Add hover mode for better interaction
+fig_trends.update_layout(
+    hovermode='x unified',
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=1.05,
+        bgcolor="rgba(255, 255, 255, 0.8)"
+    )
+)
+
+# Apply consistent styling
+fig_trends = apply_consistent_style(fig_trends)
+
+st.plotly_chart(fig_trends, use_container_width=True)
+
+# Add detailed statistics in an expander
+with st.expander("View Detailed Company Statistics"):
+    # Calculate summary statistics for each company
+    company_summary = company_trends.groupby("Employer (Petitioner) Name").agg({
+        "Total Applications": ["sum", "mean", "std"],
+        "Initial Approval": "sum",
+        "Initial Denial": "sum",
+        "Continuing Approval": "sum",
+        "Continuing Denial": "sum"
+    }).round(0)
+    
+    # Flatten column names
+    company_summary.columns = ['_'.join(col).strip() for col in company_summary.columns.values]
+    
+    # Calculate approval rate
+    company_summary["approval_rate"] = (
+        (company_summary["Initial Approval_sum"] + company_summary["Continuing Approval_sum"]) /
+        company_summary["Total Applications_sum"]
+    )
+    
+    # Get the most common state for each company
+    company_states = (
+        df_state[df_state["Employer (Petitioner) Name"].isin(company_summary.index)]
+        .groupby("Employer (Petitioner) Name")["Petitioner State"]
+        .agg(lambda x: x.mode().iloc[0] if not x.empty else "Unknown")
+    )
+    
+    # Add state to company summary
+    company_summary["State"] = company_states
+    
+    # Format the summary table
+    company_summary["Total Applications"] = company_summary["Total Applications_sum"].map("{:,}".format)
+    company_summary["Average Yearly Applications"] = company_summary["Total Applications_mean"].map("{:,.0f}".format)
+    company_summary["Approval Rate"] = company_summary["approval_rate"].map("{:.1%}".format)
+    
+    # Select and reorder columns for display
+    display_columns = [
+        "State",
+        "Total Applications",
+        "Average Yearly Applications",
+        "Approval Rate"
+    ]
+    
+    st.dataframe(
+        company_summary[display_columns],
+        use_container_width=True
+    )
+
+st.markdown("---")
+
 ## Company Size Distribution
 with st.expander("Company Size Distribution (experimental, may not be accurate)"):
     st.subheader("H1B Applications by Company Size")
@@ -529,10 +739,99 @@ fig_rate = apply_consistent_style(fig_rate)
 
 st.plotly_chart(fig_rate, use_container_width=True)
 
+st.markdown("---")
 
+# Add new section for company size approval rates
+st.subheader("H‑1B Approval Rate by Company Size")
+st.markdown("""
+Compare how approval rates vary across different company sizes over time. This visualization helps identify 
+whether small, medium, or large companies have different success rates in their H‑1B applications.
+""")
 
+# Calculate approval rates by company size
+size_rate = (
+    fdf
+    .groupby(["Fiscal Year", "Company Size"])
+    .agg({
+        "Initial Approval": "sum",
+        "Initial Denial": "sum",
+        "Continuing Approval": "sum",
+        "Continuing Denial": "sum"
+    })
+    .reset_index()
+)
 
+size_rate["total"] = (
+    size_rate["Initial Approval"] + 
+    size_rate["Initial Denial"] + 
+    size_rate["Continuing Approval"] + 
+    size_rate["Continuing Denial"]
+)
 
+size_rate["approval_rate"] = (
+    (size_rate["Initial Approval"] + size_rate["Continuing Approval"])
+    / size_rate["total"]
+)
+
+# Create line chart
+fig_size_rate = px.line(
+    size_rate,
+    x="Fiscal Year",
+    y="approval_rate",
+    color="Company Size",
+    markers=True,
+    labels={"approval_rate": "Approval Rate"},
+    title="H‑1B Approval Rate by Company Size Over Time",
+    color_discrete_map={
+        'Small': '#636EFA',
+        'Medium': '#EF553B',
+        'Large': '#00CC96'
+    }
+)
+
+# Update y-axis to show percentages
+fig_size_rate.update_yaxes(tickformat=".0%")
+
+# Update hover template
+fig_size_rate.update_traces(
+    hovertemplate="%{y:.1%}<extra></extra>",
+    line=dict(width=2)
+)
+
+# Add hover mode for better interaction
+fig_size_rate.update_layout(
+    hovermode='x unified',
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=1.05,
+        bgcolor="rgba(255, 255, 255, 0.8)"
+    )
+)
+
+# Apply consistent styling
+fig_size_rate = apply_consistent_style(fig_size_rate)
+
+st.plotly_chart(fig_size_rate, use_container_width=True)
+
+# Add summary statistics in an expander
+with st.expander("View Detailed Statistics by Company Size"):
+    # Calculate average approval rates by company size
+    size_summary = size_rate.groupby("Company Size").agg({
+        "approval_rate": "mean",
+        "total": "sum"
+    }).round(3)
+    
+    # Format the summary table
+    size_summary["Approval Rate"] = size_summary["approval_rate"].map("{:.1%}".format)
+    size_summary["Total Applications"] = size_summary["total"].map("{:,}".format)
+    size_summary = size_summary[["Approval Rate", "Total Applications"]]
+    
+    st.dataframe(
+        size_summary,
+        use_container_width=True
+    )
 
 st.markdown("---")
 
@@ -675,21 +974,6 @@ fig = apply_consistent_style(fig)
 
 st.plotly_chart(fig, use_container_width=True)
 
-
-# ── Load OEWS wage data ─────────────────────────────────────────────────
-wage_df = pd.read_csv("Data/oe_industry_wages_clean.csv")
-# Ensure NAICS is same type as your fdf
-wage_df["NAICS"] = wage_df["NAICS"].astype(str)
-fdf["Industry (NAICS) Code"] = fdf["Industry (NAICS) Code"].astype(str)
-
-# Normalize NAICS codes by extracting just the numeric part
-def normalize_naics(code):
-    # Extract first number from formats like "54" or "54 - Professional, Scientific, and Technical Services"
-    match = re.search(r'^(\d+)', str(code))
-    return match.group(1) if match else code
-
-wage_df["NAICS_norm"] = wage_df["NAICS"].apply(normalize_naics)
-fdf["NAICS_norm"] = fdf["Industry (NAICS) Code"].apply(normalize_naics)
 
 # ── Controls in a row ───────────────────────────────────────────────────
 # Industry selection in its own row
@@ -837,6 +1121,241 @@ if summary_data:
     )
 
 st.markdown("---")  # Add divider before the footer
+
+# Add new section for industry geographical distribution
+st.subheader("Geographical Distribution of H1B Applications by Industry")
+st.markdown("""
+Explore how different industries are distributed across states. This visualization helps identify 
+regional specialization in hiring foreign talent for specific sectors.
+""")
+
+# Get unique industries and create a multiselect
+industries = sorted(fdf["Industry (NAICS) Code"].unique())
+selected_industries = st.multiselect(
+    "Select Industries to Compare:",
+    options=industries,
+    default=industries[:3] if len(industries) >= 3 else industries,
+    help="Choose up to 5 industries to compare their geographical distribution"
+)
+
+# Get top 5 states by total applications
+top_states = (
+    fdf.groupby("Petitioner State")["Total Applications"]
+    .sum()
+    .nlargest(5)
+    .index
+    .tolist()
+)
+
+# Add state filter - handle NaN values and use multiselect
+available_states = sorted(fdf["Petitioner State"].dropna().unique())
+selected_states = st.multiselect(
+    "Select States to View:",
+    options=available_states,
+    default=top_states,
+    help="Choose states to compare their industry distributions"
+)
+
+if selected_industries and selected_states:
+    # Limit to 5 industries for better visualization
+    selected_industries = selected_industries[:5]
+    
+    # Filter data based on selected states
+    filtered_df = fdf[fdf["Petitioner State"].isin(selected_states)]
+    
+    # Calculate state-level statistics for selected industries
+    industry_state_stats = (
+        filtered_df[filtered_df["Industry (NAICS) Code"].isin(selected_industries)]
+        .groupby(["Petitioner State", "Industry (NAICS) Code"])
+        .agg({
+            "Total Applications": "sum",
+            "Initial Approval": "sum",
+            "Initial Denial": "sum",
+            "Continuing Approval": "sum",
+            "Continuing Denial": "sum"
+        })
+        .reset_index()
+    )
+    
+    # Create a grouped bar chart
+    fig_industry_geo = px.bar(
+        industry_state_stats,
+        x="Petitioner State",
+        y="Total Applications",
+        color="Industry (NAICS) Code",
+        barmode="group",
+        title=f"H1B Applications by State and Industry",
+        labels={
+            "Total Applications": "Number of Applications",
+            "Petitioner State": "State",
+            "Industry (NAICS) Code": "Industry"
+        }
+    )
+    
+    # Update hover template
+    fig_industry_geo.update_traces(
+        hovertemplate="<b>%{fullData.name}</b><br>" +
+                     "State: %{x}<br>" +
+                     "Applications: %{y:,}<br>" +
+                     "<extra></extra>"
+    )
+    
+    # Add hover mode for better interaction
+    fig_industry_geo.update_layout(
+        hovermode='x unified',
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=1.05,
+            bgcolor="rgba(255, 255, 255, 0.8)"
+        ),
+        xaxis=dict(
+            tickangle=45,
+            tickmode='array',
+            ticktext=industry_state_stats["Petitioner State"].unique(),
+            tickvals=industry_state_stats["Petitioner State"].unique()
+        )
+    )
+    
+    # Apply consistent styling
+    fig_industry_geo = apply_consistent_style(fig_industry_geo)
+    
+    st.plotly_chart(fig_industry_geo, use_container_width=True)
+    
+    # Add detailed statistics in an expander
+    with st.expander("View Detailed Statistics by State and Industry"):
+        # Calculate summary statistics
+        industry_summary = industry_state_stats.groupby(["Industry (NAICS) Code", "Petitioner State"]).agg({
+            "Total Applications": "sum",
+            "Initial Approval": "sum",
+            "Initial Denial": "sum",
+            "Continuing Approval": "sum",
+            "Continuing Denial": "sum"
+        }).reset_index()
+        
+        # Calculate approval rate
+        industry_summary["Approval Rate"] = (
+            (industry_summary["Initial Approval"] + industry_summary["Continuing Approval"]) /
+            industry_summary["Total Applications"]
+        ).round(3)
+        
+        # Format the summary table
+        industry_summary["Total Applications"] = industry_summary["Total Applications"].map("{:,}".format)
+        industry_summary["Approval Rate"] = industry_summary["Approval Rate"].map("{:.1%}".format)
+        
+        # Pivot the table for better readability
+        pivot_table = industry_summary.pivot(
+            index="Industry (NAICS) Code",
+            columns="Petitioner State",
+            values=["Total Applications", "Approval Rate"]
+        )
+        
+        st.dataframe(
+            pivot_table,
+            use_container_width=True
+        )
+
+st.markdown("---")
+
+# Add new section for top industries by state
+st.subheader("Top Industries by State")
+st.markdown("""
+This heatmap shows the concentration of different industries across states. Darker colors indicate higher 
+concentration of H1B applications in that industry for that state. This helps identify regional 
+specialization and industry clusters.
+""")
+
+# Get top 10 states by total applications
+top_states = (
+    fdf.groupby("Petitioner State")["Total Applications"]
+    .sum()
+    .nlargest(10)
+    .index
+    .tolist()
+)
+
+# Get top 10 industries nationally
+top_industries = (
+    fdf.groupby("Industry (NAICS) Code")["Total Applications"]
+    .sum()
+    .nlargest(10)
+    .index
+    .tolist()
+)
+
+# Calculate industry concentration by state
+industry_state_matrix = (
+    fdf[fdf["Industry (NAICS) Code"].isin(top_industries)]
+    .groupby(["Petitioner State", "Industry (NAICS) Code"])["Total Applications"]
+    .sum()
+    .unstack(fill_value=0)
+)
+
+# Calculate percentage of total applications for each state
+state_totals = industry_state_matrix.sum(axis=1)
+industry_state_pct = industry_state_matrix.div(state_totals, axis=0) * 100
+
+# Filter to top states
+industry_state_pct = industry_state_pct.loc[top_states]
+
+# Create heatmap
+fig_heatmap = px.imshow(
+    industry_state_pct,
+    labels=dict(
+        x="Industry",
+        y="State",
+        color="Percentage of Applications"
+    ),
+    aspect="auto",
+    color_continuous_scale="Viridis",
+    title="Industry Concentration by State (Top 10 States and Industries)"
+)
+
+# Update layout for better readability
+fig_heatmap.update_layout(
+    xaxis=dict(
+        tickangle=45,
+        tickmode='array',
+        ticktext=[f"{ind[:30]}..." if len(ind) > 30 else ind for ind in industry_state_pct.columns],
+        tickvals=industry_state_pct.columns
+    ),
+    yaxis=dict(
+        tickmode='array',
+        ticktext=industry_state_pct.index,
+        tickvals=industry_state_pct.index
+    ),
+    coloraxis_colorbar=dict(
+        title="% of State's<br>Applications",
+        ticksuffix="%"
+    )
+)
+
+# Update hover template
+fig_heatmap.update_traces(
+    hovertemplate="<b>%{y}</b><br>" +
+                 "Industry: %{x}<br>" +
+                 "Percentage: %{z:.1f}%<br>" +
+                 "<extra></extra>"
+)
+
+# Apply consistent styling
+fig_heatmap = apply_consistent_style(fig_heatmap)
+
+st.plotly_chart(fig_heatmap, use_container_width=True)
+
+# Add detailed statistics in an expander
+with st.expander("View Detailed Industry Statistics by State"):
+    # Calculate and format the statistics
+    stats_df = industry_state_pct.round(1)
+    stats_df = stats_df.style.format("{:.1f}%")
+    
+    st.dataframe(
+        stats_df,
+        use_container_width=True
+    )
+
+st.markdown("---")
 
 # Add footer at the very end of the app
 st.markdown("""
